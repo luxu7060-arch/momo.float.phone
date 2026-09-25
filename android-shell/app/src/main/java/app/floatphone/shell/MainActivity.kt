@@ -85,7 +85,7 @@ class MainActivity : AppCompatActivity() {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        WindowCompat.setDecorFitsSystemWindows(window, true)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
         // 音量键默认调媒体流：WebView 里的语音条/TTS 都走媒体流播放，
         // 不设的话短音频没在播时按键调的是铃声，用户感觉"音量键无效、声音巨大"
         volumeControlStream = AudioManager.STREAM_MUSIC
