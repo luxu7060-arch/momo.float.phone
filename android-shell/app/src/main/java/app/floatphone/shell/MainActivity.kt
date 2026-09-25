@@ -243,5 +243,35 @@ class MainActivity : AppCompatActivity() {
                 )
             }
         }
+        /** 网页备份导出：把 Blob 转成 base64 后调用此方法直接写入「下载」目录 */
+        @JavascriptInterface
+        fun saveFile(base64Data: String, fileName: String) {
+            runOnUiThread {
+                runCatching {
+                    val comma = base64Data.indexOf(',')
+                    val pureBase64 = if (comma >= 0) base64Data.substring(comma + 1) else base64Data
+                    val bytes = android.util.Base64.decode(pureBase64, android.util.Base64.DEFAULT)
+
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        val values = ContentValues().apply {
+                            put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                            put(MediaStore.MediaColumns.MIME_TYPE, "application/octet-stream")
+                            put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                        }
+                        val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                        uri?.let { contentResolver.openOutputStream(it)?.use { out -> out.write(bytes) } }
+                            ?: error("无法创建目标文件")
+                    } else {
+                        val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                        if (!dir.exists()) dir.mkdirs()
+                        java.io.File(dir, fileName).writeBytes(bytes)
+                    }
+                    Toast.makeText(this@MainActivity, "已保存到「下载」目录：$fileName", Toast.LENGTH_LONG).show()
+                }.onFailure {
+                    Toast.makeText(this@MainActivity, "保存失败：${it.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
     }
+}
 }
