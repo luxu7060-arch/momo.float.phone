@@ -11,8 +11,6 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
-import android.provider.MediaStore
-import android.util.Base64
 import android.provider.Settings
 import android.webkit.CookieManager
 import android.webkit.DownloadListener
@@ -23,7 +21,6 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
-import java.io.OutputStream
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -44,9 +41,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private lateinit var webView: WebView
-    
-    private var exportUri: Uri? = null
-    private var exportOutputStream: OutputStream? = null
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
 
     private val fileChooserLauncher = registerForActivityResult(
@@ -161,10 +155,10 @@ class MainActivity : AppCompatActivity() {
         webView.setDownloadListener(DownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
             runCatching {
                 if (url.startsWith("blob:") || url.startsWith("data:")) {
-    Toast.makeText(this, "正在导出…", Toast.LENGTH_SHORT).show()
-    startBlobDownload(url, contentDisposition, mimeType)
-    return@DownloadListener
-}
+                    // blob/data 由页面内 JS 触发的 a[download] 处理；提示用户等待
+                    Toast.makeText(this, "正在导出…", Toast.LENGTH_SHORT).show()
+                    return@DownloadListener
+                }
                 val request = DownloadManager.Request(Uri.parse(url)).apply {
                     addRequestHeader("User-Agent", userAgent)
                     addRequestHeader("Cookie", CookieManager.getInstance().getCookie(url) ?: "")
@@ -190,42 +184,6 @@ class MainActivity : AppCompatActivity() {
         ensurePushService()
     }
 
-    private fun startBlobDownload(url: String, contentDisposition: String?, mimeType: String?) {
-    val jsUrl = url.replace("\\", "\\\\").replace("'", "\\'")
-
-    webView.evaluateJavascript(
-        """
-        (async function() {
-            try {
-                const response = await fetch('$jsUrl');
-                const blob = await response.blob();
-                const buffer = await blob.arrayBuffer();
-                const bytes = new Uint8Array(buffer);
-                const chunkSize = 32768;
-
-                AndroidShell.beginFile(
-                    'momo-backup.zip',
-                    '${mimeType ?: "application/zip"}'
-                );
-
-                for (let i = 0; i < bytes.length; i += chunkSize) {
-                    const chunk = bytes.slice(i, Math.min(i + chunkSize, bytes.length));
-                    let binary = '';
-                    for (let j = 0; j < chunk.length; j++) {
-                        binary += String.fromCharCode(chunk[j]);
-                    }
-                    AndroidShell.appendFileChunk(btoa(binary));
-                }
-
-                AndroidShell.finishFile();
-            } catch (e) {
-                AndroidShell.abortFile();
-            }
-        })();
-        """.trimIndent(),
-        null
-    )
-}
     /** singleTask：App 已在运行时（如全屏来电页接听）通过 onNewIntent 送达深链 */
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
@@ -260,80 +218,6 @@ class MainActivity : AppCompatActivity() {
 
     /** 暴露给网页的原生桥（网页侧可用 window.AndroidShell 特性检测壳环境）。 */
     inner class ShellBridge {
-            @JavascriptInterface
-    fun beginFile(fileName: String, mimeType: String) {
-        runCatching {
-            exportOutputStream?.close()
-            exportOutputStream = null
-            exportUri = null
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val values = android.content.ContentValues().apply {
-                    put(MediaStore.Downloads.DISPLAY_NAME, fileName)
-                    put(MediaStore.Downloads.MIME_TYPE, mimeType)
-                    put(
-                        MediaStore.Downloads.RELATIVE_PATH,
-                        Environment.DIRECTORY_DOWNLOADS
-                    )
-                    put(MediaStore.Downloads.IS_PENDING, 1)
-                }
-
-                exportUri = contentResolver.insert(
-                    MediaStore.Downloads.EXTERNAL_CONTENT_URI,
-                    values
-                )
-
-                val uri = exportUri ?: error("无法创建下载文件")
-                exportOutputStream = contentResolver.openOutputStream(uri)
-                    ?: error("无法打开下载文件")
-            }
-        }
-    }
-            @JavascriptInterface
-    fun appendFileChunk(base64: String) {
-        runCatching {
-            val bytes = Base64.decode(base64, Base64.DEFAULT)
-            exportOutputStream?.write(bytes)
-        }
-    }
-        
-            @JavascriptInterface
-    fun finishFile() {
-        runCatching {
-            exportOutputStream?.flush()
-            exportOutputStream?.close()
-            exportOutputStream = null
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                exportUri?.let { uri ->
-                    val values = android.content.ContentValues().apply {
-                        put(MediaStore.Downloads.IS_PENDING, 0)
-                    }
-                    contentResolver.update(uri, values, null, null)
-                }
-            }
-
-            exportUri = null
-            Toast.makeText(this, "备份已保存到「下载」目录", Toast.LENGTH_SHORT).show()
-        }
-    }
-        
-            @JavascriptInterface
-    fun abortFile() {
-        runCatching {
-            exportOutputStream?.close()
-            exportOutputStream = null
-
-            exportUri?.let { uri ->
-                contentResolver.delete(uri, null, null)
-            }
-
-            exportUri = null
-        }
-
-        Toast.makeText(this, "备份导出失败", Toast.LENGTH_SHORT).show()
-    }
-        
         @JavascriptInterface
         fun getVersion(): String = VERSION
 
