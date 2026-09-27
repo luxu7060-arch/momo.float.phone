@@ -52,48 +52,68 @@ class MainActivity : AppCompatActivity() {
         /**
          * 注入到页面里的"blob 导出劫持"脚本。
          * 网页端备份/导出功能一般是：生成 Blob -> new URL.createObjectURL(blob)
-         * -> 造一个 <a download> 元素 -> element.click()。
+         * -> 渲染一个 <a download> 链接/按钮，用户手指点击。
          * WebView 原生的 DownloadListener 拿到的只是 blob: 这个 URL 字符串，
-         * 读不到 blob 真正的数据，所以之前的实现只能弹个"正在导出…"就结束了，
-         * 文件根本没有落盘。
+         * 读不到 blob 真正的数据，所以之前只能弹个"正在导出…"就结束了，文件
+         * 根本没有落盘。
          *
-         * 这里改成在页面 JS 上下文里拦截：只要是 a.download 且 href 以 blob: 开头
-         * 的点击，就用 fetch 把 blob 内容读出来、转成 base64，再通过
-         * AndroidShell.saveBase64File 传回原生真正写文件，同时阻止默认行为。
+         * 关键点：必须在 document 上用【捕获阶段】监听真实的 click 事件，
+         * 而不是重写 a.click() 这个 JS 方法——后者只能拦住代码自己调用
+         * element.click() 的场景，拦不住用户手指真实点击触发的浏览器默认下载
+         * 行为。捕获阶段的事件监听器在浏览器执行"默认下载动作"之前就能拿到
+         * 事件并 preventDefault()，无论点击是手指点出来的还是代码模拟出来的
+         * 都能生效。
+         *
+         * 拦下来之后用 fetch 把 blob 内容读出来、转成 base64，再通过
+         * AndroidShell.saveBase64File 传回原生真正写文件。
          */
         private const val BLOB_DOWNLOAD_BRIDGE_JS = """
             (function() {
                 if (window.__floatShellDownloadPatched) return;
                 window.__floatShellDownloadPatched = true;
-                var originalClick = HTMLAnchorElement.prototype.click;
-                HTMLAnchorElement.prototype.click = function() {
-                    try {
-                        if (this.download && this.href && this.href.indexOf('blob:') === 0) {
-                            var filename = this.download || ('download_' + Date.now());
-                            var href = this.href;
-                            fetch(href).then(function(res) { return res.blob(); }).then(function(blob) {
-                                var reader = new FileReader();
-                                reader.onloadend = function() {
-                                    try {
-                                        var dataUrl = reader.result;
-                                        var comma = dataUrl.indexOf(',');
-                                        var meta = dataUrl.substring(5, comma);
-                                        var mime = (meta.split(';')[0] || 'application/octet-stream');
-                                        var base64 = dataUrl.substring(comma + 1);
-                                        if (window.AndroidShell && window.AndroidShell.saveBase64File) {
-                                            window.AndroidShell.saveBase64File(filename, base64, mime);
-                                        }
-                                    } catch (e) { console.error('FloatShell export encode failed', e); }
-                                };
-                                reader.readAsDataURL(blob);
-                            }).catch(function(e) {
-                                console.error('FloatShell export fetch failed', e);
-                            });
-                            return;
-                        }
-                    } catch (e) { console.error('FloatShell export intercept failed', e); }
-                    return originalClick.apply(this, arguments);
-                };
+
+                function findDownloadAnchor(el) {
+                    while (el && el !== document) {
+                        if (el.tagName === 'A' && el.hasAttribute('download')) return el;
+                        el = el.parentNode;
+                    }
+                    return null;
+                }
+
+                function exportBlob(anchor) {
+                    var filename = anchor.getAttribute('download') || ('backup_' + Date.now());
+                    var href = anchor.href;
+                    fetch(href).then(function(res) { return res.blob(); }).then(function(blob) {
+                        var reader = new FileReader();
+                        reader.onloadend = function() {
+                            try {
+                                var dataUrl = reader.result;
+                                var comma = dataUrl.indexOf(',');
+                                var meta = dataUrl.substring(5, comma);
+                                var mime = (meta.split(';')[0] || 'application/octet-stream');
+                                var base64 = dataUrl.substring(comma + 1);
+                                if (window.AndroidShell && window.AndroidShell.saveBase64File) {
+                                    window.AndroidShell.saveBase64File(filename, base64, mime);
+                                } else {
+                                    console.error('FloatShell bridge missing saveBase64File');
+                                }
+                            } catch (e) { console.error('FloatShell export encode failed', e); }
+                        };
+                        reader.readAsDataURL(blob);
+                    }).catch(function(e) {
+                        console.error('FloatShell export fetch failed', e);
+                    });
+                }
+
+                // 捕获阶段：抢在浏览器默认下载行为、以及页面自身的 click 监听之前拿到事件
+                document.addEventListener('click', function(e) {
+                    var anchor = findDownloadAnchor(e.target);
+                    if (anchor && anchor.href && anchor.href.indexOf('blob:') === 0) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        exportBlob(anchor);
+                    }
+                }, true);
             })();
         """
     }
