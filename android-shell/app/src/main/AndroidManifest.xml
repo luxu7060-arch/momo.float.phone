@@ -21,6 +21,7 @@
         android:allowBackup="true"
         android:supportsRtl="true"
         android:usesCleartextTraffic="false"
+        android:networkSecurityConfig="@xml/network_security_config" 
         android:theme="@style/Theme.FloatShell">
 
         <activity
