@@ -3,6 +3,7 @@ package app.floatphone.shell
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.DownloadManager
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -11,7 +12,9 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.provider.MediaStore
 import android.provider.Settings
+import android.util.Base64
 import android.webkit.CookieManager
 import android.webkit.DownloadListener
 import android.webkit.JavascriptInterface
@@ -30,6 +33,8 @@ import android.graphics.Rect
 import android.view.MotionEvent
 import android.view.ViewGroup
 import android.widget.FrameLayout
+import java.io.File
+import java.io.FileOutputStream
 import kotlin.math.abs
 
 /**
@@ -43,6 +48,54 @@ class MainActivity : AppCompatActivity() {
         const val VERSION = "1.0.0"
         /** 来电接听等场景的站内深链（必须以 SITE_URL 开头，否则忽略） */
         const val EXTRA_OPEN_URL = "open_url"
+
+        /**
+         * 注入到页面里的"blob 导出劫持"脚本。
+         * 网页端备份/导出功能一般是：生成 Blob -> new URL.createObjectURL(blob)
+         * -> 造一个 <a download> 元素 -> element.click()。
+         * WebView 原生的 DownloadListener 拿到的只是 blob: 这个 URL 字符串，
+         * 读不到 blob 真正的数据，所以之前的实现只能弹个"正在导出…"就结束了，
+         * 文件根本没有落盘。
+         *
+         * 这里改成在页面 JS 上下文里拦截：只要是 a.download 且 href 以 blob: 开头
+         * 的点击，就用 fetch 把 blob 内容读出来、转成 base64，再通过
+         * AndroidShell.saveBase64File 传回原生真正写文件，同时阻止默认行为。
+         */
+        private const val BLOB_DOWNLOAD_BRIDGE_JS = """
+            (function() {
+                if (window.__floatShellDownloadPatched) return;
+                window.__floatShellDownloadPatched = true;
+                var originalClick = HTMLAnchorElement.prototype.click;
+                HTMLAnchorElement.prototype.click = function() {
+                    try {
+                        if (this.download && this.href && this.href.indexOf('blob:') === 0) {
+                            var filename = this.download || ('download_' + Date.now());
+                            var href = this.href;
+                            fetch(href).then(function(res) { return res.blob(); }).then(function(blob) {
+                                var reader = new FileReader();
+                                reader.onloadend = function() {
+                                    try {
+                                        var dataUrl = reader.result;
+                                        var comma = dataUrl.indexOf(',');
+                                        var meta = dataUrl.substring(5, comma);
+                                        var mime = (meta.split(';')[0] || 'application/octet-stream');
+                                        var base64 = dataUrl.substring(comma + 1);
+                                        if (window.AndroidShell && window.AndroidShell.saveBase64File) {
+                                            window.AndroidShell.saveBase64File(filename, base64, mime);
+                                        }
+                                    } catch (e) { console.error('FloatShell export encode failed', e); }
+                                };
+                                reader.readAsDataURL(blob);
+                            }).catch(function(e) {
+                                console.error('FloatShell export fetch failed', e);
+                            });
+                            return;
+                        }
+                    } catch (e) { console.error('FloatShell export intercept failed', e); }
+                    return originalClick.apply(this, arguments);
+                };
+            })();
+        """
     }
 
     private lateinit var webView: WebView
@@ -133,6 +186,13 @@ class MainActivity : AppCompatActivity() {
                     startActivity(Intent(Intent.ACTION_VIEW, url)); true
                 }.getOrDefault(true)
             }
+
+            override fun onPageFinished(view: WebView, url: String?) {
+                super.onPageFinished(view, url)
+                // 每次页面加载完成都重新注入一次：SPA 路由跳转、刷新都会重新触发
+                // onPageFinished，脚本内部有 __floatShellDownloadPatched 标记防止重复劫持
+                view.evaluateJavascript(BLOB_DOWNLOAD_BRIDGE_JS, null)
+            }
         }
 
         webView.webChromeClient = object : WebChromeClient() {
@@ -164,10 +224,11 @@ class MainActivity : AppCompatActivity() {
         }
 
         // 备份导出等下载：交给系统下载管理器，落到公共下载目录
+        // 注意：blob:/data: 这一支理论上不会再走到（已在页面 JS 里被 BLOB_DOWNLOAD_BRIDGE_JS
+        // 拦截并通过 AndroidShell.saveBase64File 落盘），这里保留作为兜底提示。
         webView.setDownloadListener(DownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
             runCatching {
                 if (url.startsWith("blob:") || url.startsWith("data:")) {
-                    // blob/data 由页面内 JS 触发的 a[download] 处理；提示用户等待
                     Toast.makeText(this, "正在导出…", Toast.LENGTH_SHORT).show()
                     return@DownloadListener
                 }
@@ -222,6 +283,37 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * 把字节数组真正写到系统"下载"目录。
+     * Android 10 (API 29) 及以上走 MediaStore，走 Scoped Storage，不需要额外的存储权限；
+     * 低于 API 29 走传统公共目录直写，并通过 DownloadManager.addCompletedDownload
+     * 让文件出现在系统"下载"App / 通知里。
+     */
+    private fun saveBytesToDownloads(filename: String, mimeType: String, bytes: ByteArray): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val resolver = contentResolver
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
+                put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
+                put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+            }
+            val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return false
+            resolver.openOutputStream(uri)?.use { it.write(bytes) } ?: return false
+            true
+        } else {
+            val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            if (!dir.exists()) dir.mkdirs()
+            val file = File(dir, filename)
+            FileOutputStream(file).use { it.write(bytes) }
+            runCatching {
+                (getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).addCompletedDownload(
+                    filename, filename, true, mimeType, file.absolutePath, bytes.size.toLong(), true,
+                )
+            }
+            true
+        }
+    }
+
     override fun onDestroy() {
         CookieManager.getInstance().flush()
         webView.destroy()
@@ -253,6 +345,38 @@ class MainActivity : AppCompatActivity() {
                     Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))
                         .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
                 )
+            }
+        }
+
+        /**
+         * 网页导出/备份用：把 base64 编码的文件内容真正写到系统"下载"目录。
+         * 配合 [BLOB_DOWNLOAD_BRIDGE_JS] 劫持 blob 下载后调用。
+         *
+         * @param filename 文件名（网页侧 a.download 的值）
+         * @param base64Data 不带 "data:xxx;base64," 前缀的纯 base64 内容
+         * @param mimeType 文件的 MIME 类型
+         * @return 是否保存成功
+         */
+        @JavascriptInterface
+        fun saveBase64File(filename: String, base64Data: String, mimeType: String): Boolean {
+            val safeName = filename.ifBlank { "backup_${System.currentTimeMillis()}" }
+            val resolvedMime = mimeType.ifBlank { "application/octet-stream" }
+            return try {
+                val bytes = Base64.decode(base64Data, Base64.DEFAULT)
+                val saved = saveBytesToDownloads(safeName, resolvedMime, bytes)
+                runOnUiThread {
+                    Toast.makeText(
+                        this@MainActivity,
+                        if (saved) "已保存到「下载」目录：$safeName" else "保存失败",
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                }
+                saved
+            } catch (e: Exception) {
+                runOnUiThread {
+                    Toast.makeText(this@MainActivity, "保存失败：${e.message}", Toast.LENGTH_SHORT).show()
+                }
+                false
             }
         }
     }
